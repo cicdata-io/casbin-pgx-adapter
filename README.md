@@ -1,4 +1,4 @@
-# Go-pg Adapter
+# Go pgx Adapter is a fork of go-pg adapter but replace the go-pg clien with pgx
 
 [![Go](https://github.com/casbin/casbin-pg-adapter/actions/workflows/ci.yml/badge.svg)](https://github.com/casbin/casbin-pg-adapter/actions/workflows/ci.yml)
 [![Coverage Status](https://coveralls.io/repos/github/casbin/casbin-pg-adapter/badge.svg?branch=master)](https://coveralls.io/github/casbin/casbin-pg-adapter?branch=master)
