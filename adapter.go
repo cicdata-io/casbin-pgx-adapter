@@ -19,12 +19,12 @@ type CasbinRule struct {
 	tableName struct{} `pg:"_"`
 	ID        string
 	Ptype     string
-	V0        string
-	V1        string
-	V2        string
-	V3        string
-	V4        string
-	V5        string
+	V0        *string
+	V1        *string
+	V2        *string
+	V3        *string
+	V4        *string
+	V5        *string
 }
 
 type Filter struct {
@@ -169,9 +169,25 @@ func (a *Adapter) createTableIfNotExists() error {
 	return err
 }
 
+// getStringLength safely returns the length of a string pointer.
+func getStringLength(s *string) int {
+	if s == nil {
+		return 0
+	}
+	return len(*s)
+}
+
 // getValues returns the V0-V5 values as a slice
 func (r *CasbinRule) getValues() []string {
-	return []string{r.V0, r.V1, r.V2, r.V3, r.V4, r.V5}
+	values := []string{}
+	for _, v := range []*string{r.V0, r.V1, r.V2, r.V3, r.V4, r.V5} {
+		if v != nil {
+			values = append(values, *v)
+		} else {
+			values = append(values, "")
+		}
+	}
+	return values
 }
 
 // getLastNonEmptyIndex returns the index of the last non-empty value in the given slice
@@ -191,8 +207,8 @@ func (r *CasbinRule) String() string {
 
 	sb.Grow(
 		len(r.Ptype) +
-			len(r.V0) + len(r.V1) + len(r.V2) +
-			len(r.V3) + len(r.V4) + len(r.V5),
+			getStringLength(r.V0) + getStringLength(r.V1) + getStringLength(r.V2) +
+			getStringLength(r.V3) + getStringLength(r.V4) + getStringLength(r.V5),
 	)
 
 	sb.WriteString(r.Ptype)
@@ -243,22 +259,22 @@ func savePolicyLine(ptype string, rule []string) *CasbinRule {
 
 	l := len(rule)
 	if l > 0 {
-		line.V0 = rule[0]
+		line.V0 = &rule[0]
 	}
 	if l > 1 {
-		line.V1 = rule[1]
+		line.V1 = &rule[1]
 	}
 	if l > 2 {
-		line.V2 = rule[2]
+		line.V2 = &rule[2]
 	}
 	if l > 3 {
-		line.V3 = rule[3]
+		line.V3 = &rule[3]
 	}
 	if l > 4 {
-		line.V4 = rule[4]
+		line.V4 = &rule[4]
 	}
 	if l > 5 {
-		line.V5 = rule[5]
+		line.V5 = &rule[5]
 	}
 
 	line.ID = policyID(ptype, rule)
@@ -511,22 +527,22 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 
 	line.Ptype = ptype
 	if fieldIndex <= 0 && 0 < fieldIndex+len(fieldValues) {
-		line.V0 = fieldValues[0-fieldIndex]
+		line.V0 = &fieldValues[0-fieldIndex]
 	}
 	if fieldIndex <= 1 && 1 < fieldIndex+len(fieldValues) {
-		line.V1 = fieldValues[1-fieldIndex]
+		line.V1 = &fieldValues[1-fieldIndex]
 	}
 	if fieldIndex <= 2 && 2 < fieldIndex+len(fieldValues) {
-		line.V2 = fieldValues[2-fieldIndex]
+		line.V2 = &fieldValues[2-fieldIndex]
 	}
 	if fieldIndex <= 3 && 3 < fieldIndex+len(fieldValues) {
-		line.V3 = fieldValues[3-fieldIndex]
+		line.V3 = &fieldValues[3-fieldIndex]
 	}
 	if fieldIndex <= 4 && 4 < fieldIndex+len(fieldValues) {
-		line.V4 = fieldValues[4-fieldIndex]
+		line.V4 = &fieldValues[4-fieldIndex]
 	}
 	if fieldIndex <= 5 && 5 < fieldIndex+len(fieldValues) {
-		line.V5 = fieldValues[5-fieldIndex]
+		line.V5 = &fieldValues[5-fieldIndex]
 	}
 
 	newP := make([]CasbinRule, 0, len(newPolicies))
