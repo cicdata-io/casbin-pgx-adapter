@@ -5,7 +5,7 @@ services:
     build:
       context: ./postgres
     ports:
-      - 5432:5432
+      - 5433:5432
     environment:
       - POSTGRES_PASSWORD=password
   go:
@@ -22,7 +22,7 @@ services:
     command:
       - go
       - test
-      - github.com/casbin/casbin-pg-adapter
+      - github.com/cicdata-io/casbin-pgx-adapter
 
 volumes:
   gopkg:
