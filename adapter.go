@@ -7,8 +7,7 @@ import (
 
 	"github.com/casbin/casbin/v2/model"
 	"github.com/casbin/casbin/v2/persist"
-	"github.com/go-pg/pg/v10"
-	"github.com/go-pg/pg/v10/orm"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mmcloughlin/meow"
 )
 
@@ -20,12 +19,12 @@ type CasbinRule struct {
 	tableName struct{} `pg:"_"`
 	ID        string
 	Ptype     string
-	V0        string `pg:",use_zero"`
-	V1        string `pg:",use_zero"`
-	V2        string `pg:",use_zero"`
-	V3        string `pg:",use_zero"`
-	V4        string `pg:",use_zero"`
-	V5        string `pg:",use_zero"`
+	V0        string
+	V1        string
+	V2        string
+	V3        string
+	V4        string
+	V5        string
 }
 
 type Filter struct {
@@ -33,9 +32,9 @@ type Filter struct {
 	G []string
 }
 
-// Adapter represents the github.com/go-pg/pg adapter for policy storage.
+// Adapter represents the pgx adapter for policy storage.
 type Adapter struct {
-	db              *pg.DB
+	db              *pgxpool.Pool
 	tableName       string
 	skipTableCreate bool
 	filtered        bool
@@ -44,43 +43,88 @@ type Adapter struct {
 type Option func(a *Adapter)
 
 // NewAdapter is the constructor for Adapter.
-// param:arg should be a PostgreS URL string or of type *pg.Options
-// param:dbname is the name of the database to use and can is optional.
-// If no dbname is provided, the default database name is "casbin" which will be created automatically.
-// If arg is *pg.Options, the arg.Database field is omitted and will be modified according to dbname
-func NewAdapter(arg interface{}, dbname ...string) (*Adapter, error) {
-	var db *pg.DB
-	var err error
-
-	if len(dbname) > 0 {
-		db, err = createCasbinDatabase(arg, dbname[0])
-	} else {
-		db, err = createCasbinDatabase(arg, DefaultDatabaseName)
+func NewAdapter(connString string, dbname ...string) (*Adapter, error) {
+	config, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("pgadapter.NewAdapter: %v", err)
 	}
 
+	if len(dbname) > 0 {
+		config.ConnConfig.Database = dbname[0]
+		createCasbinDatabase(connString, dbname[0])
+
+	} else {
+		config.ConnConfig.Database = DefaultDatabaseName
+		createCasbinDatabase(connString, DefaultDatabaseName)
+	}
+
+	db, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		return nil, fmt.Errorf("pgadapter.NewAdapter: %v", err)
 	}
 
 	a := &Adapter{db: db, tableName: DefaultTableName}
 
-	if err := a.createTableifNotExists(); err != nil {
+	if err := a.createTableIfNotExists(); err != nil {
 		return nil, fmt.Errorf("pgadapter.NewAdapter: %v", err)
 	}
 
 	return a, nil
 }
 
+func createCasbinDatabase(arg interface{}, dbname string) error {
+	var connString string
+	var ok bool
+
+	if connString, ok = arg.(string); !ok {
+		return fmt.Errorf("must pass in a PostgreSQL connection string, received %T instead", arg)
+	}
+
+	// Connect to the default database
+	config, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return fmt.Errorf("failed to parse connection string: %v", err)
+	}
+
+	// Temporarily connect to the default database
+	tempConfig := *config
+	tempConfig.ConnConfig.Database = "postgres"
+	tempPool, err := pgxpool.NewWithConfig(context.Background(), &tempConfig)
+	if err != nil {
+		return fmt.Errorf("failed to connect to default database: %v", err)
+	}
+	defer tempPool.Close()
+
+	// Check if the database already exists
+	var exists bool
+	err = tempPool.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", dbname).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("failed to check if database exists: %v", err)
+	}
+
+	if exists {
+		return nil // Database already exists, no need to create
+	}
+
+	// Create the new database
+	_, err = tempPool.Exec(context.Background(), fmt.Sprintf("CREATE DATABASE %s", dbname))
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return fmt.Errorf("failed to create database: %v", err)
+	}
+
+	return nil
+}
+
 // NewAdapterByDB creates new Adapter by using existing DB connection
 // creates table from CasbinRule struct if it doesn't exist
-func NewAdapterByDB(db *pg.DB, opts ...Option) (*Adapter, error) {
+func NewAdapterByDB(db *pgxpool.Pool, opts ...Option) (*Adapter, error) {
 	a := &Adapter{db: db, tableName: DefaultTableName}
 	for _, opt := range opts {
 		opt(a)
 	}
 
 	if !a.skipTableCreate {
-		if err := a.createTableifNotExists(); err != nil {
+		if err := a.createTableIfNotExists(); err != nil {
 			return nil, fmt.Errorf("pgadapter.NewAdapter: %v", err)
 		}
 	}
@@ -102,53 +146,27 @@ func SkipTableCreate() Option {
 	}
 }
 
-func createCasbinDatabase(arg interface{}, dbname string) (*pg.DB, error) {
-	var opts *pg.Options
-	var err error
-	if connURL, ok := arg.(string); ok {
-		opts, err = pg.ParseURL(connURL)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		opts, ok = arg.(*pg.Options)
-		if !ok {
-			return nil, fmt.Errorf("must pass in a PostgreS URL string or an instance of *pg.Options, received %T instead", arg)
-		}
-	}
-
-	db := pg.Connect(opts)
-	defer db.Close()
-
-	_, err = db.Exec(fmt.Sprintf("CREATE DATABASE %s", dbname))
-	if err != nil && !strings.Contains(err.Error(), "42P04") {
-		return nil, err
-	}
-	db.Close()
-
-	opts.Database = dbname
-	db = pg.Connect(opts)
-
-	return db, nil
-}
-
-// Close close database connection
+// Close closes the database connection.
 func (a *Adapter) Close() error {
 	if a != nil && a.db != nil {
-		return a.db.Close()
+		a.db.Close()
 	}
 	return nil
 }
 
-func (a *Adapter) createTableifNotExists() error {
-	err := a.db.Model((*CasbinRule)(nil)).Table(a.tableName).CreateTable(&orm.CreateTableOptions{
-		Temp:        false,
-		IfNotExists: true,
-	})
-	if err != nil {
-		return err
-	}
-	return nil
+func (a *Adapter) createTableIfNotExists() error {
+	_, err := a.db.Exec(context.Background(), fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id TEXT PRIMARY KEY,
+			ptype TEXT,
+			v0 TEXT,
+			v1 TEXT,
+			v2 TEXT,
+			v3 TEXT,
+			v4 TEXT,
+			v5 TEXT
+		)`, a.tableName))
+	return err
 }
 
 // getValues returns the V0-V5 values as a slice
@@ -178,10 +196,10 @@ func (r *CasbinRule) String() string {
 	)
 
 	sb.WriteString(r.Ptype)
-	
+
 	values := r.getValues()
 	lastIndex := getLastNonEmptyIndex(values)
-	
+
 	// Include all values up to and including the last non-empty one
 	// This preserves empty strings in the middle while trimming trailing empty strings
 	for i := 0; i <= lastIndex; i++ {
@@ -192,23 +210,25 @@ func (r *CasbinRule) String() string {
 	return sb.String()
 }
 
-// LoadPolicy loads policy from database.
+// LoadPolicy loads policy from the database.
 func (a *Adapter) LoadPolicy(model model.Model) error {
-	var lines []*CasbinRule
-
-	if err := a.db.Model(&lines).Table(a.tableName).Select(); err != nil {
+	rows, err := a.db.Query(context.Background(), fmt.Sprintf("SELECT id, ptype, v0, v1, v2, v3, v4, v5 FROM %s", a.tableName))
+	if err != nil {
 		return err
 	}
+	defer rows.Close()
 
-	for _, line := range lines {
-		err := persist.LoadPolicyLine(line.String(), model)
-		if err != nil {
+	for rows.Next() {
+		var line CasbinRule
+		if err := rows.Scan(&line.ID, &line.Ptype, &line.V0, &line.V1, &line.V2, &line.V3, &line.V4, &line.V5); err != nil {
+			return err
+		}
+		if err := persist.LoadPolicyLine(line.String(), model); err != nil {
 			return err
 		}
 	}
 
 	a.filtered = false
-
 	return nil
 }
 
@@ -248,13 +268,13 @@ func savePolicyLine(ptype string, rule []string) *CasbinRule {
 
 // SavePolicy saves policy to database.
 func (a *Adapter) SavePolicy(model model.Model) error {
-	tx, err := a.db.Begin()
+	tx, err := a.db.Begin(context.Background())
 	if err != nil {
 		return fmt.Errorf("start DB transaction: %v", err)
 	}
-	defer tx.Close()
+	defer tx.Rollback(context.Background())
 
-	_, err = tx.Model((*CasbinRule)(nil)).Table(a.tableName).Where("id IS NOT NULL").Delete()
+	_, err = tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id IS NOT NULL", a.tableName))
 	if err != nil {
 		return err
 	}
@@ -276,15 +296,17 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 	}
 
 	for _, line := range lines {
-		_, err = tx.Model(line).Table(a.tableName).
-			OnConflict("DO NOTHING").
-			Insert()
+		_, err = tx.Exec(context.Background(), fmt.Sprintf(`
+			INSERT INTO %s (id, ptype, v0, v1, v2, v3, v4, v5)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT DO NOTHING`, a.tableName),
+			line.ID, line.Ptype, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5)
 		if err != nil {
 			return err
 		}
 	}
 
-	err = tx.Commit()
+	err = tx.Commit(context.Background())
 	if err != nil {
 		return fmt.Errorf("commit DB transaction: %v", err)
 	}
@@ -295,94 +317,86 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 // AddPolicy adds a policy rule to the storage.
 func (a *Adapter) AddPolicy(sec string, ptype string, rule []string) error {
 	line := savePolicyLine(ptype, rule)
-	err := a.db.RunInTransaction(context.Background(), func(tx *pg.Tx) error {
-		_, err := a.db.Model(line).
-			Table(a.tableName).
-			OnConflict("DO NOTHING").
-			Insert()
-
-		return err
-	})
-
+	_, err := a.db.Exec(context.Background(), fmt.Sprintf(`
+		INSERT INTO %s (id, ptype, v0, v1, v2, v3, v4, v5)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT DO NOTHING`, a.tableName),
+		line.ID, line.Ptype, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5)
 	return err
 }
 
 // AddPolicies adds policy rules to the storage.
 func (a *Adapter) AddPolicies(sec string, ptype string, rules [][]string) error {
-	var lines []*CasbinRule
+	tx, err := a.db.Begin(context.Background())
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+
 	for _, rule := range rules {
 		line := savePolicyLine(ptype, rule)
-		lines = append(lines, line)
+		_, err := tx.Exec(context.Background(), fmt.Sprintf(`
+			INSERT INTO %s (id, ptype, v0, v1, v2, v3, v4, v5)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT DO NOTHING`, a.tableName),
+			line.ID, line.Ptype, line.V0, line.V1, line.V2, line.V3, line.V4, line.V5)
+		if err != nil {
+			return err
+		}
 	}
 
-	err := a.db.RunInTransaction(context.Background(), func(tx *pg.Tx) error {
-		_, err := tx.Model(&lines).
-			Table(a.tableName).
-			OnConflict("DO NOTHING").
-			Insert()
+	err = tx.Commit(context.Background())
+	if err != nil {
 		return err
-	})
+	}
 
-	return err
+	return nil
 }
 
 // RemovePolicy removes a policy rule from the storage.
 func (a *Adapter) RemovePolicy(sec string, ptype string, rule []string) error {
 	line := savePolicyLine(ptype, rule)
-	err := a.db.RunInTransaction(context.Background(), func(tx *pg.Tx) error {
-		_, err := a.db.Model(line).Table(a.tableName).WherePK().Delete()
-		return err
-	})
-
+	_, err := a.db.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.tableName), line.ID)
 	return err
 }
 
 // RemovePolicies removes policy rules from the storage.
 func (a *Adapter) RemovePolicies(sec string, ptype string, rules [][]string) error {
-	var lines []*CasbinRule
+	tx, err := a.db.Begin(context.Background())
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+
 	for _, rule := range rules {
 		line := savePolicyLine(ptype, rule)
-		lines = append(lines, line)
+		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE id = $1", a.tableName), line.ID)
+		if err != nil {
+			return err
+		}
 	}
 
-	err := a.db.RunInTransaction(context.Background(), func(tx *pg.Tx) error {
-		_, err := tx.Model(&lines).Table(a.tableName).
-			Delete()
+	err = tx.Commit(context.Background())
+	if err != nil {
 		return err
-	})
+	}
 
-	return err
+	return nil
 }
 
 // RemoveFilteredPolicy removes policy rules that match the filter from the storage.
 func (a *Adapter) RemoveFilteredPolicy(sec string, ptype string, fieldIndex int, fieldValues ...string) error {
-	query := a.db.Model((*CasbinRule)(nil)).Table(a.tableName).Where("ptype = ?", ptype)
+	query := fmt.Sprintf("DELETE FROM %s WHERE ptype = $1", a.tableName)
+	args := []interface{}{ptype}
 
-	idx := fieldIndex + len(fieldValues)
-	if fieldIndex <= 0 && idx > 0 && fieldValues[0-fieldIndex] != "" {
-		query = query.Where("v0 = ?", fieldValues[0-fieldIndex])
-	}
-	if fieldIndex <= 1 && idx > 1 && fieldValues[1-fieldIndex] != "" {
-		query = query.Where("v1 = ?", fieldValues[1-fieldIndex])
-	}
-	if fieldIndex <= 2 && idx > 2 && fieldValues[2-fieldIndex] != "" {
-		query = query.Where("v2 = ?", fieldValues[2-fieldIndex])
-	}
-	if fieldIndex <= 3 && idx > 3 && fieldValues[3-fieldIndex] != "" {
-		query = query.Where("v3 = ?", fieldValues[3-fieldIndex])
-	}
-	if fieldIndex <= 4 && idx > 4 && fieldValues[4-fieldIndex] != "" {
-		query = query.Where("v4 = ?", fieldValues[4-fieldIndex])
-	}
-	if fieldIndex <= 5 && idx > 5 && fieldValues[5-fieldIndex] != "" {
-		query = query.Where("v5 = ?", fieldValues[5-fieldIndex])
+	for i, v := range fieldValues {
+		if v != "" {
+			query += fmt.Sprintf(" AND v%d = $%d", fieldIndex+i, len(args)+1)
+			args = append(args, v)
+		}
 	}
 
-	err := a.db.RunInTransaction(context.Background(), func(tx *pg.Tx) error {
-		_, err := query.Delete()
-		return err
-	})
-
+	_, err := a.db.Exec(context.Background(), query, args...)
 	return err
 }
 
@@ -403,64 +417,54 @@ func (a *Adapter) LoadFilteredPolicy(model model.Model, filter interface{}) erro
 	return nil
 }
 
-func buildQuery(query *orm.Query, values []string) (*orm.Query, error) {
-	for ind, v := range values {
-		if v == "" {
-			continue
-		}
-		switch ind {
-		case 0:
-			query = query.Where("v0 = ?", v)
-		case 1:
-			query = query.Where("v1 = ?", v)
-		case 2:
-			query = query.Where("v2 = ?", v)
-		case 3:
-			query = query.Where("v3 = ?", v)
-		case 4:
-			query = query.Where("v4 = ?", v)
-		case 5:
-			query = query.Where("v5 = ?", v)
-		default:
-			return nil, fmt.Errorf("filter has more values than expected, should not exceed 6 values")
+func buildQuery(query string, values []string) (string, []interface{}) {
+	args := []interface{}{}
+	for i, v := range values {
+		if v != "" {
+			query += fmt.Sprintf(" AND v%d = $%d", i, len(args)+1)
+			args = append(args, v)
 		}
 	}
-	return query, nil
+	return query, args
 }
 
 func (a *Adapter) loadFilteredPolicy(model model.Model, filter *Filter, handler func(string, model.Model) error) error {
 	if filter.P != nil {
-		lines := []*CasbinRule{}
-
-		query := a.db.Model(&lines).Table(a.tableName).Where("ptype = 'p'")
-		query, err := buildQuery(query, filter.P)
+		query := fmt.Sprintf("SELECT id, ptype, v0, v1, v2, v3, v4, v5 FROM %s WHERE ptype = 'p'", a.tableName)
+		query, args := buildQuery(query, filter.P)
+		rows, err := a.db.Query(context.Background(), query, args...)
 		if err != nil {
 			return err
 		}
-		err = query.Select()
-		if err != nil {
-			return err
-		}
+		defer rows.Close()
 
-		for _, line := range lines {
-			handler(line.String(), model)
+		for rows.Next() {
+			var line CasbinRule
+			if err := rows.Scan(&line.ID, &line.Ptype, &line.V0, &line.V1, &line.V2, &line.V3, &line.V4, &line.V5); err != nil {
+				return err
+			}
+			if err := handler(line.String(), model); err != nil {
+				return err
+			}
 		}
 	}
 	if filter.G != nil {
-		lines := []*CasbinRule{}
-
-		query := a.db.Model(&lines).Table(a.tableName).Where("ptype = 'g'")
-		query, err := buildQuery(query, filter.G)
+		query := fmt.Sprintf("SELECT id, ptype, v0, v1, v2, v3, v4, v5 FROM %s WHERE ptype = 'g'", a.tableName)
+		query, args := buildQuery(query, filter.G)
+		rows, err := a.db.Query(context.Background(), query, args...)
 		if err != nil {
 			return err
 		}
-		err = query.Select()
-		if err != nil {
-			return err
-		}
+		defer rows.Close()
 
-		for _, line := range lines {
-			handler(line.String(), model)
+		for rows.Next() {
+			var line CasbinRule
+			if err := rows.Scan(&line.ID, &line.Ptype, &line.V0, &line.V1, &line.V2, &line.V3, &line.V4, &line.V5); err != nil {
+				return err
+			}
+			if err := handler(line.String(), model); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -478,16 +482,28 @@ func (a *Adapter) UpdatePolicy(sec string, ptype string, oldRule, newPolicy []st
 
 // UpdatePolicies updates some policy rules to storage, like db, redis.
 func (a *Adapter) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) error {
-	oldLines := make([]*CasbinRule, 0, len(oldRules))
-	newLines := make([]*CasbinRule, 0, len(newRules))
-	for _, rule := range oldRules {
-		oldLines = append(oldLines, savePolicyLine(ptype, rule))
+	tx, err := a.db.Begin(context.Background())
+	if err != nil {
+		return err
 	}
-	for _, rule := range newRules {
-		newLines = append(newLines, savePolicyLine(ptype, rule))
+	defer tx.Rollback(context.Background())
+
+	for i, oldRule := range oldRules {
+		oldLine := savePolicyLine(ptype, oldRule)
+		newLine := savePolicyLine(ptype, newRules[i])
+		_, err := tx.Exec(context.Background(), fmt.Sprintf("UPDATE %s SET ptype = $1, v0 = $2, v1 = $3, v2 = $4, v3 = $5, v4 = $6, v5 = $7 WHERE id = $8", a.tableName),
+			newLine.Ptype, newLine.V0, newLine.V1, newLine.V2, newLine.V3, newLine.V4, newLine.V5, oldLine.ID)
+		if err != nil {
+			return err
+		}
 	}
 
-	return a.updatePolicies(oldLines, newLines)
+	err = tx.Commit(context.Background())
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) ([][]string, error) {
@@ -519,24 +535,32 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 		newP = append(newP, *(savePolicyLine(ptype, newRule)))
 	}
 
-	err := a.db.RunInTransaction(context.Background(), func(tx *pg.Tx) error {
-		for i := range newP {
-			str, args := line.queryString()
-			_, err := tx.Model(&oldP).Table(a.tableName).Where(str, args...).Delete()
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-			_, err = tx.Model(&newP[i]).Table(a.tableName).
-				OnConflict("DO NOTHING").
-				Insert()
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
+	tx, err := a.db.Begin(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(context.Background())
+
+	for i := range newP {
+		str, args := line.queryString()
+		_, err := tx.Exec(context.Background(), fmt.Sprintf("DELETE FROM %s WHERE %s", a.tableName, str), args...)
+		if err != nil {
+			return nil, err
 		}
-		return nil
-	})
+
+		_, err = tx.Exec(context.Background(), fmt.Sprintf(`
+			INSERT INTO %s (id, ptype, v0, v1, v2, v3, v4, v5)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT DO NOTHING`, a.tableName),
+			newP[i].ID, newP[i].Ptype, newP[i].V0, newP[i].V1, newP[i].V2, newP[i].V3, newP[i].V4, newP[i].V5)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if err = tx.Commit(context.Background()); err != nil {
+		return nil, err
+	}
 
 	// return deleted rulues
 	oldPolicies := make([][]string, 0)
@@ -546,19 +570,18 @@ func (a *Adapter) UpdateFilteredPolicies(sec string, ptype string, newPolicies [
 	}
 	return oldPolicies, err
 }
-
 func (c *CasbinRule) queryString() (string, []interface{}) {
 	queryArgs := []interface{}{c.Ptype}
-	queryStr := "ptype = ?"
+	queryStr := "ptype = $1"
 
 	values := c.getValues()
 	lastIndex := getLastNonEmptyIndex(values)
-	
+
 	// Include all fields up to and including the last non-empty one
 	// This ensures empty strings in the middle are matched explicitly
 	fields := []string{"v0", "v1", "v2", "v3", "v4", "v5"}
 	for i := 0; i <= lastIndex; i++ {
-		queryStr += " and " + fields[i] + " = ?"
+		queryStr += fmt.Sprintf(" AND %s = $%d", fields[i], len(queryArgs)+1)
 		queryArgs = append(queryArgs, values[i])
 	}
 
@@ -570,36 +593,36 @@ func (c *CasbinRule) toStringPolicy() []string {
 	if c.Ptype != "" {
 		policy = append(policy, c.Ptype)
 	}
-	
+
 	values := c.getValues()
 	lastIndex := getLastNonEmptyIndex(values)
-	
+
 	// Include all values up to and including the last non-empty one
 	// This preserves empty strings in the middle while trimming trailing empty strings
 	for i := 0; i <= lastIndex; i++ {
 		policy = append(policy, values[i])
 	}
-	
+
 	return policy
 }
 
 func (a *Adapter) updatePolicies(oldLines, newLines []*CasbinRule) error {
-	tx, err := a.db.Begin()
+	tx, err := a.db.Begin(context.Background())
 	if err != nil {
 		return err
 	}
-	defer tx.Close()
+	defer tx.Rollback(context.Background())
 
 	for i, line := range oldLines {
-		str, args := line.queryString()
-		_, err = tx.Model(newLines[i]).Table(a.tableName).Where(str, args...).Update()
+		str, _ := line.queryString()
+		_, err = tx.Exec(context.Background(), fmt.Sprintf("UPDATE %s SET ptype = $1, v0 = $2, v1 = $3, v2 = $4, v3 = $5, v4 = $6, v5 = $7 WHERE %s", a.tableName, str),
+			newLines[i].Ptype, newLines[i].V0, newLines[i].V1, newLines[i].V2, newLines[i].V3, newLines[i].V4, newLines[i].V5)
 		if err != nil {
-			tx.Rollback()
 			return err
 		}
 	}
 
-	if err = tx.Commit(); err != nil {
+	if err = tx.Commit(context.Background()); err != nil {
 		return err
 	}
 	return nil
